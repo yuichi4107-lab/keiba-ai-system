@@ -96,8 +96,13 @@ class BaneiPredictor:
             scores.append(hit_rate)
             logger.info("Fold %d: 的中率 = %.3f", fold + 1, hit_rate)
 
-        # 全データで最終モデルを学習
-        self.model = lgb.LGBMClassifier(**LIGHTGBM_PARAMS)
+        # 全データで最終モデルを学習（early stoppingは無効化）
+        final_params = {
+            k: v
+            for k, v in LIGHTGBM_PARAMS.items()
+            if k != "early_stopping_rounds"
+        }
+        self.model = lgb.LGBMClassifier(**final_params)
         self.model.fit(X, y)
 
         results = {

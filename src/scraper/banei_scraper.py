@@ -1,9 +1,15 @@
 """帯広ばんえい競馬のレース結果データスクレイパー
 
 地方競馬の公式サイト (keiba.go.jp) からレース結果データを取得する。
+
+URL構造:
+  - レース一覧: /KeibaWeb/TodayRaceInfo/RaceList?k_raceDate=YYYY/MM/DD&k_babaCode=36
+  - 出馬表:     /KeibaWeb/TodayRaceInfo/DebaTable?k_raceDate=YYYY/MM/DD&k_raceNo=N&k_babaCode=36
+  - 成績:       /KeibaWeb/TodayRaceInfo/RaceMarkTable?k_raceDate=YYYY/MM/DD&k_raceNo=N&k_babaCode=36
 """
 
 import logging
+import re
 import time
 from datetime import date, timedelta
 
@@ -12,15 +18,15 @@ import requests
 from bs4 import BeautifulSoup
 
 from config.settings import (
-    BASE_URL,
     OBIHIRO_COURSE_CODE,
-    RACE_RESULT_URL,
     RAW_DATA_DIR,
     REQUEST_INTERVAL,
     USER_AGENT,
 )
 
 logger = logging.getLogger(__name__)
+
+BASE = "https://www.keiba.go.jp/KeibaWeb/TodayRaceInfo"
 
 
 class BaneiScraper:
@@ -43,132 +49,190 @@ class BaneiScraper:
             logger.error("リクエスト失敗: %s - %s", url, e)
             return None
 
+    def _get_html(self, url: str, params: dict | None = None) -> str | None:
+        """GETリクエストを送信してHTML文字列を返す（pandas.read_html用）"""
+        try:
+            resp = self.session.get(url, params=params, timeout=30)
+            resp.raise_for_status()
+            resp.encoding = resp.apparent_encoding
+            time.sleep(REQUEST_INTERVAL)
+            return resp.text
+        except requests.RequestException as e:
+            logger.error("リクエスト失敗: %s - %s", url, e)
+            return None
+
     def get_race_list(self, race_date: date) -> list[dict]:
         """指定日のレース一覧を取得する"""
         date_str = race_date.strftime("%Y/%m/%d")
-        params = {"k_raceDate": date_str, "k_baession": OBIHIRO_COURSE_CODE}
-        soup = self._get(BASE_URL, params=params)
+        params = {"k_raceDate": date_str, "k_babaCode": OBIHIRO_COURSE_CODE}
+        soup = self._get(f"{BASE}/RaceList", params=params)
         if soup is None:
             return []
 
         races = []
-        race_table = soup.find("table", class_="tblRaceList")
-        if race_table is None:
-            logger.info("レース情報なし: %s", date_str)
-            return []
-
-        for row in race_table.find_all("tr"):
-            link = row.find("a")
-            if link and "RaceMarkTable" in link.get("href", ""):
-                race_no_cell = row.find("td")
-                if race_no_cell:
-                    race_info = {
-                        "date": date_str,
-                        "race_no": race_no_cell.get_text(strip=True),
-                        "url": "https://www.keiba.go.jp" + link["href"],
-                    }
-                    races.append(race_info)
+        # レース一覧ページからリンクを抽出
+        for link in soup.find_all("a", href=True):
+            href = link["href"]
+            if "RaceMarkTable" in href or "DebaTable" in href:
+                # レース番号をURLパラメータから抽出
+                race_no_match = re.search(r"k_raceNo=(\d+)", href)
+                if race_no_match:
+                    race_no = race_no_match.group(1)
+                    # 重複チェック
+                    if not any(r["race_no"] == race_no for r in races):
+                        races.append(
+                            {
+                                "date": date_str,
+                                "race_no": race_no,
+                            }
+                        )
 
         logger.info("%s: %d レース取得", date_str, len(races))
         return races
 
-    def get_race_result(self, race_url: str) -> dict | None:
-        """レース結果の詳細を取得する"""
-        soup = self._get(race_url)
-        if soup is None:
+    def get_race_result(self, race_date: date, race_no: str) -> list[dict]:
+        """レース結果の詳細を取得する
+
+        pandas.read_html でテーブルを取得し、
+        BeautifulSoupで補足情報（レース名等）を取得する。
+        """
+        date_str = race_date.strftime("%Y/%m/%d")
+        params = {
+            "k_raceDate": date_str,
+            "k_raceNo": race_no,
+            "k_babaCode": OBIHIRO_COURSE_CODE,
+        }
+
+        # HTML取得
+        html = self._get_html(f"{BASE}/RaceMarkTable", params=params)
+        if html is None:
+            return []
+
+        soup = BeautifulSoup(html, "lxml")
+
+        # レース情報を取得
+        race_name = ""
+        distance = None
+        track_condition = ""
+
+        # レース名
+        for elem in soup.find_all(["h3", "span", "div"]):
+            text = elem.get_text(strip=True)
+            if text and "レース" in text and len(text) < 50:
+                race_name = text
+                break
+
+        # 距離・馬場情報
+        page_text = soup.get_text()
+        dist_match = re.search(r"(\d{2,4})\s*m", page_text)
+        if dist_match:
+            distance = int(dist_match.group(1))
+
+        for cond in ["良", "稍重", "重", "不良"]:
+            if cond in page_text:
+                track_condition = cond
+                break
+
+        # テーブルをpandasで読み込み
+        try:
+            tables = pd.read_html(html)
+        except ValueError:
+            logger.warning("テーブルが見つかりません: %s R%s", date_str, race_no)
+            return []
+
+        if not tables:
+            return []
+
+        # 最も列数が多いテーブルを結果テーブルとみなす
+        result_table = max(tables, key=lambda t: len(t.columns))
+
+        records = []
+        for _, row in result_table.iterrows():
+            record = self._parse_result_row(row, race_date, race_no, race_name, distance, track_condition)
+            if record:
+                records.append(record)
+
+        return records
+
+    def _parse_result_row(
+        self,
+        row: pd.Series,
+        race_date: date,
+        race_no: str,
+        race_name: str,
+        distance: int | None,
+        track_condition: str,
+    ) -> dict | None:
+        """pandas DataFrameの行をパースしてレコードを作成"""
+        values = [str(v) for v in row.values]
+        text = " ".join(values)
+
+        # 少なくとも馬名らしき日本語と数字が含まれること
+        has_japanese = bool(re.search(r"[\u3040-\u9fff]{2,}", text))
+        has_number = bool(re.search(r"\d", text))
+        if not has_japanese or not has_number:
             return None
 
-        result = {"horses": []}
+        record = {
+            "race_date": race_date.strftime("%Y-%m-%d"),
+            "race_no": race_no,
+            "race_name": race_name,
+            "distance": distance,
+            "track_condition": track_condition,
+        }
 
-        # レース名・条件
-        race_name_elem = soup.find("span", class_="raceName")
-        if race_name_elem:
-            result["race_name"] = race_name_elem.get_text(strip=True)
+        # カラム数に応じてマッピング
+        cols = list(row.index)
+        vals = list(row.values)
 
-        race_info_elem = soup.find("div", class_="raceInfo")
-        if race_info_elem:
-            info_text = race_info_elem.get_text(strip=True)
-            result["race_info"] = info_text
-            # 距離を抽出
-            if "m" in info_text:
-                for part in info_text.split():
-                    if "m" in part:
-                        try:
-                            result["distance"] = int(
-                                part.replace("m", "").replace(",", "")
-                            )
-                        except ValueError:
-                            pass
-                        break
+        # 一般的な地方競馬結果テーブルのカラム順:
+        # 着順, 枠番, 馬番, 馬名, 性齢, 馬体重, 騎手, タイム, 負担重量, 調教師, オッズ, 人気
+        field_mappings = [
+            ("finish_order", self._safe_int),
+            ("post_position", self._safe_int),
+            ("horse_number", self._safe_int),
+            ("horse_name", str),
+            ("sex_age", str),
+            ("horse_weight", self._safe_float),
+            ("jockey", str),
+            ("time", str),
+            ("weight_carry", self._safe_float),
+            ("trainer", str),
+            ("odds", self._safe_float),
+            ("popularity", self._safe_int),
+        ]
 
-        # 馬柱テーブルから出走馬情報を取得
-        result_table = soup.find("table", class_="tblResultData")
-        if result_table is None:
-            result_table = soup.find("table", id="resultLs")
-        if result_table is None:
-            # フォールバック: 最も大きなテーブルを使用
-            tables = soup.find_all("table")
-            if tables:
-                result_table = max(tables, key=lambda t: len(t.find_all("tr")))
+        for i, (field_name, converter) in enumerate(field_mappings):
+            if i < len(vals):
+                try:
+                    val = str(vals[i]).strip()
+                    if val in ("nan", "None", ""):
+                        record[field_name] = None
+                    else:
+                        record[field_name] = converter(val)
+                except (ValueError, TypeError):
+                    record[field_name] = None
 
-        if result_table is None:
-            logger.warning("結果テーブルが見つかりません: %s", race_url)
-            return result
+        # 性別と年齢を分離
+        sex_age = record.get("sex_age", "")
+        if sex_age and isinstance(sex_age, str) and len(sex_age) >= 2:
+            record["sex"] = sex_age[0]
+            record["age"] = self._safe_int(sex_age[1:])
 
-        rows = result_table.find_all("tr")
-        for row in rows[1:]:  # ヘッダー行をスキップ
-            cells = row.find_all("td")
-            if len(cells) < 6:
-                continue
+        return record
 
-            horse = self._parse_horse_row(cells)
-            if horse:
-                result["horses"].append(horse)
-
-        return result
-
-    def _parse_horse_row(self, cells: list) -> dict | None:
-        """テーブル行から馬データをパースする"""
+    @staticmethod
+    def _safe_int(value) -> int | None:
         try:
-            texts = [c.get_text(strip=True) for c in cells]
-
-            horse = {
-                "finish_order": self._safe_int(texts[0]),
-                "post_position": self._safe_int(texts[1]),
-                "horse_number": self._safe_int(texts[2]) if len(texts) > 2 else None,
-                "horse_name": texts[3] if len(texts) > 3 else "",
-                "sex_age": texts[4] if len(texts) > 4 else "",
-                "horse_weight": self._safe_float(texts[5]) if len(texts) > 5 else None,
-                "jockey": texts[6] if len(texts) > 6 else "",
-                "time": texts[7] if len(texts) > 7 else "",
-                "weight_carry": self._safe_float(texts[8]) if len(texts) > 8 else None,
-                "trainer": texts[9] if len(texts) > 9 else "",
-                "odds": self._safe_float(texts[10]) if len(texts) > 10 else None,
-                "popularity": self._safe_int(texts[11]) if len(texts) > 11 else None,
-            }
-
-            # 性別と年齢を分離
-            if horse["sex_age"] and len(horse["sex_age"]) >= 2:
-                horse["sex"] = horse["sex_age"][0]
-                horse["age"] = self._safe_int(horse["sex_age"][1:])
-
-            return horse
-        except (IndexError, ValueError) as e:
-            logger.debug("馬データのパース失敗: %s", e)
+            return int(str(value).replace(",", "").strip())
+        except (ValueError, AttributeError, TypeError):
             return None
 
     @staticmethod
-    def _safe_int(value: str) -> int | None:
+    def _safe_float(value) -> float | None:
         try:
-            return int(value.replace(",", "").strip())
-        except (ValueError, AttributeError):
-            return None
-
-    @staticmethod
-    def _safe_float(value: str) -> float | None:
-        try:
-            return float(value.replace(",", "").strip())
-        except (ValueError, AttributeError):
+            return float(str(value).replace(",", "").strip())
+        except (ValueError, AttributeError, TypeError):
             return None
 
     def scrape_date_range(
@@ -181,17 +245,8 @@ class BaneiScraper:
         while current <= end_date:
             races = self.get_race_list(current)
             for race in races:
-                result = self.get_race_result(race["url"])
-                if result and result.get("horses"):
-                    for horse in result["horses"]:
-                        record = {
-                            "race_date": current.strftime("%Y-%m-%d"),
-                            "race_no": race["race_no"],
-                            "race_name": result.get("race_name", ""),
-                            "distance": result.get("distance"),
-                            **horse,
-                        }
-                        all_records.append(record)
+                records = self.get_race_result(current, race["race_no"])
+                all_records.extend(records)
 
             current += timedelta(days=1)
 

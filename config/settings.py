@@ -12,8 +12,6 @@ PROCESSED_DATA_DIR = DATA_DIR / "processed"
 MODELS_DIR = PROJECT_ROOT / "models"
 
 # スクレイピング設定
-BASE_URL = "https://www.keiba.go.jp/KeibaWeb/TodayRaceInfo/RaceList"
-RACE_RESULT_URL = "https://www.keiba.go.jp/KeibaWeb/TodayRaceInfo/RaceMarkTable"
 REQUEST_INTERVAL = 2  # リクエスト間隔（秒）
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
