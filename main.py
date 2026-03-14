@@ -105,22 +105,30 @@ def cmd_predict(args):
         logger.error("学習済みモデルが見つかりません。先に `python main.py train` を実行してください")
         sys.exit(1)
 
-    # 当日のレースデータ取得
-    logger.info("%s のレースデータを取得中...", target_date)
-    scraper = BaneiScraper()
-    df = scraper.scrape_date_range(target_date, target_date)
-
-    if df.empty:
-        logger.error("%s のレースデータがありません", target_date)
-        sys.exit(1)
-
-    # 過去データと結合して特徴量生成
     raw_file = RAW_DATA_DIR / "race_results.csv"
-    if raw_file.exists():
-        past_df = pd.read_csv(raw_file)
-        combined = pd.concat([past_df, df], ignore_index=True)
+
+    if getattr(args, "from_csv", False):
+        # 既存CSVから当日データを使用
+        if not raw_file.exists():
+            logger.error("データファイルが見つかりません: %s", raw_file)
+            sys.exit(1)
+        combined = pd.read_csv(raw_file)
+        logger.info("CSVデータから %s のレースを抽出", target_date)
     else:
-        combined = df
+        # スクレイピングで当日データを取得
+        logger.info("%s のレースデータを取得中...", target_date)
+        scraper = BaneiScraper()
+        df = scraper.scrape_date_range(target_date, target_date)
+
+        if df.empty:
+            logger.error("%s のレースデータがありません", target_date)
+            sys.exit(1)
+
+        if raw_file.exists():
+            past_df = pd.read_csv(raw_file)
+            combined = pd.concat([past_df, df], ignore_index=True)
+        else:
+            combined = df
 
     fe = FeatureEngineer(combined)
     features_df = fe.build_features()
@@ -173,6 +181,11 @@ def main():
     # predict
     sp_predict = subparsers.add_parser("predict", help="レース結果を予測する")
     sp_predict.add_argument("--date", help="予測日 (YYYY-MM-DD, デフォルト: 本日)")
+    sp_predict.add_argument(
+        "--from-csv",
+        action="store_true",
+        help="スクレイピングせず既存CSVデータから予測する",
+    )
 
     args = parser.parse_args()
 
