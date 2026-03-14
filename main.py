@@ -235,7 +235,10 @@ def _judge_race(analysis):
 
 
 def cmd_recommend(args):
-    """推奨馬券コマンド（1R〜12R + 購入レース選定）"""
+    """推奨馬券コマンド（1R〜12R + 購入レース選定）
+
+    期待値（勝率×オッズ）> 1.0 の馬すべてを単勝購入対象とする。
+    """
     if args.date:
         target_date = datetime.strptime(args.date, "%Y-%m-%d").date()
     else:
@@ -243,23 +246,43 @@ def cmd_recommend(args):
 
     predictions = _load_predictions_for_date(args, target_date)
 
-    # --- 全レース予想 + レース分析 ---
-    race_analyses = {}
+    # --- 全レース予想 ---
     race_groups = list(predictions.groupby(["race_date", "race_no"]))
+
+    # 各レースの購入対象馬を収集
+    all_buy_tickets = []  # [(rno, number, name, prob, odds, ev), ...]
 
     print(f"\n{'='*64}")
     print(f"  帯広ばんえい競馬 単勝推奨馬券  {target_date}")
     print(f"{'='*64}")
 
     for (rd, rno), race in race_groups:
-        analysis = _analyze_race(race)
-        grade = _judge_race(analysis)
-        race_analyses[rno] = {"analysis": analysis, "grade": grade}
-
-        grade_mark = {"S": "【S】", "A": "【A】", "B": "【B】", "C": "【C】"}[grade]
-
-        print(f"\n--- {rno}R {grade_mark} ---")
         has_odds = race["odds"].notna().any()
+
+        # このレースの購入対象馬（期待値 > 1.0）を抽出
+        race_tickets = []
+        if has_odds:
+            for _, row in race.iterrows():
+                if pd.notna(row["odds"]) and row["odds"] > 0:
+                    ev = row["win_prob"] * row["odds"]
+                    if ev > 1.0:
+                        race_tickets.append({
+                            "rno": rno,
+                            "number": int(row["horse_number"]) if pd.notna(row["horse_number"]) else 0,
+                            "name": row["horse_name"],
+                            "prob": row["win_prob"],
+                            "odds": row["odds"],
+                            "ev": ev,
+                            "rank": int(row["pred_rank"]),
+                        })
+
+        num_tickets = len(race_tickets)
+        if num_tickets > 0:
+            label = f"購入{num_tickets}点"
+        else:
+            label = "見送り"
+
+        print(f"\n--- {rno}R [{label}] ---")
 
         if has_odds:
             print(f"    {'馬番':>4s}  {'馬名':10s}  {'勝率':>6s}  {'ｵｯｽﾞ':>6s}  {'期待値':>6s}")
@@ -283,67 +306,49 @@ def cmd_recommend(args):
             else:
                 print(f"  {mark} {num:>4}  {name:10s}  {prob:>7.1%}")
 
-    # --- 購入推奨レースまとめ ---
+        all_buy_tickets.extend(race_tickets)
+
+    # --- 購入馬券まとめ ---
     print(f"\n{'='*64}")
-    print(f"  購入推奨レース")
+    print(f"  購入馬券一覧（単勝 期待値 > 1.0）")
     print(f"{'='*64}")
     print()
 
-    buy_races = {rno: v for rno, v in race_analyses.items() if v["grade"] in ("S", "A")}
-    maybe_races = {rno: v for rno, v in race_analyses.items() if v["grade"] == "B"}
-    skip_races = {rno: v for rno, v in race_analyses.items() if v["grade"] == "C"}
+    if all_buy_tickets:
+        # レースごとにグループ化して表示
+        from itertools import groupby as igroupby
+        sorted_tickets = sorted(all_buy_tickets, key=lambda x: (str(x["rno"]).zfill(3), -x["ev"]))
 
-    total_cost = 0
+        buy_races = set()
+        total_tickets = 0
 
-    if buy_races:
-        print("  ◆ 購入推奨（自信度: 高）")
-        for rno, v in sorted(buy_races.items()):
-            a = v["analysis"]
-            g = v["grade"]
-            total_cost += 100
-            print(
-                f"    {str(rno):>2s}R [{g}]  {a['top_number']:>2d}番 {a['top_horse'][:8]:8s}"
-                f"  勝率{a['top_prob']:>5.1%}  ｵｯｽﾞ{a['top_odds']:>5.1f}"
-                f"  期待値{a['expected_value']:>5.2f}"
-            )
-        print()
+        for rno, tickets in igroupby(sorted_tickets, key=lambda x: x["rno"]):
+            tickets = list(tickets)
+            buy_races.add(rno)
+            print(f"  {str(rno):>2s}R:")
+            for t in tickets:
+                total_tickets += 1
+                print(
+                    f"      {t['number']:>2d}番 {t['name'][:8]:8s}"
+                    f"  勝率{t['prob']:>5.1%}  ｵｯｽﾞ{t['odds']:>5.1f}"
+                    f"  期待値{t['ev']:>5.2f}"
+                )
+            print()
 
-    if maybe_races:
-        print("  ◇ 検討（期待値はあるが自信度やや低）")
-        for rno, v in sorted(maybe_races.items()):
-            a = v["analysis"]
-            g = v["grade"]
-            total_cost += 100
-            print(
-                f"    {str(rno):>2s}R [{g}]  {a['top_number']:>2d}番 {a['top_horse'][:8]:8s}"
-                f"  勝率{a['top_prob']:>5.1%}  ｵｯｽﾞ{a['top_odds']:>5.1f}"
-                f"  期待値{a['expected_value']:>5.2f}"
-            )
-        print()
+        skip_races = [rno for (_, rno), _ in race_groups if rno not in buy_races]
+        if skip_races:
+            print(f"  見送り: {', '.join(str(r) + 'R' for r in skip_races)}")
+            print()
 
-    if skip_races:
-        print("  ✕ 見送り（期待値 < 1.0）")
-        for rno, v in sorted(skip_races.items()):
-            a = v["analysis"]
-            print(
-                f"    {str(rno):>2s}R      {a['top_number']:>2d}番 {a['top_horse'][:8]:8s}"
-                f"  勝率{a['top_prob']:>5.1%}  ｵｯｽﾞ{a['top_odds']:>5.1f}"
-                f"  期待値{a['expected_value']:>5.2f}"
-            )
-        print()
-
-    num_buy = len(buy_races) + len(maybe_races)
-    print(f"{'='*64}")
-    print(f"  本日の購入レース数: {num_buy} / {len(race_analyses)}")
-    print(f"  合計投資額（単勝各100円）: {total_cost:,}円")
-    print(f"{'='*64}")
-    print()
-    print("  判定基準:")
-    print("    S = 期待値1.5以上 & 信頼度20%以上（強く推奨）")
-    print("    A = 期待値1.2以上 & 信頼度15%以上（推奨）")
-    print("    B = 期待値1.0以上（検討）")
-    print("    C = 期待値1.0未満（見送り）")
-    print(f"{'='*64}")
+        total_cost = total_tickets * 100
+        print(f"{'='*64}")
+        print(f"  購入レース:  {len(buy_races)} / {len(race_groups)} レース")
+        print(f"  購入点数:    {total_tickets} 点")
+        print(f"  合計投資額:  {total_cost:,}円（単勝各100円）")
+        print(f"{'='*64}")
+    else:
+        print("  本日は購入推奨馬券がありません。")
+        print(f"\n{'='*64}")
 
 
 def cmd_evaluate(args):
@@ -383,31 +388,40 @@ def cmd_evaluate(args):
         how="left",
     )
 
-    # 各レースで予測1位の馬に単勝100円ずつ賭けた場合のシミュレーション
+    # 期待値 > 1.0 の馬すべてに単勝100円ずつ賭けた場合のシミュレーション
     total_bet = 0
     total_return = 0
+    total_tickets = 0
     correct = 0
     total_races = 0
+    bet_races = set()
 
     print(f"\n{'='*60}")
     print(f"  バックテスト結果")
     print(f"  テスト期間: {test_dates[0]} 〜 {test_dates[-1]}")
+    print(f"  購入条件: 期待値（勝率×オッズ）> 1.0 の馬すべて")
     print(f"{'='*60}")
 
     for (rd, rno), race in eval_df.groupby(["race_date", "race_no"]):
-        top_pick = race[race["pred_rank"] == 1].iloc[0]
-        total_bet += 100
         total_races += 1
+        for _, row in race.iterrows():
+            if pd.notna(row["odds"]) and row["odds"] > 0:
+                ev = row["win_prob"] * row["odds"]
+                if ev > 1.0:
+                    total_bet += 100
+                    total_tickets += 1
+                    bet_races.add((rd, rno))
+                    if row["finish_order"] == 1:
+                        payout = 100 * row["odds"]
+                        total_return += payout
+                        correct += 1
 
-        if top_pick["finish_order"] == 1:
-            payout = 100 * top_pick["odds"]
-            total_return += payout
-            correct += 1
-
-    hit_rate = correct / total_races if total_races > 0 else 0
+    hit_rate = correct / total_tickets if total_tickets > 0 else 0
     return_rate = total_return / total_bet if total_bet > 0 else 0
 
-    print(f"\n  レース数:     {total_races}")
+    print(f"\n  全レース数:   {total_races}")
+    print(f"  購入レース数: {len(bet_races)}")
+    print(f"  購入点数:     {total_tickets}")
     print(f"  的中数:       {correct}")
     print(f"  的中率:       {hit_rate:.1%}")
     print(f"  総賭金:       {total_bet:,.0f}円")
