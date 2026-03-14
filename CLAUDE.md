@@ -19,13 +19,17 @@ PYTHONPATH=. python main.py train
 # 予測（CSVデータから）
 PYTHONPATH=. python main.py predict --date 2025-12-30 --from-csv
 
+# バックテスト（回収率シミュレーション）
+PYTHONPATH=. python main.py evaluate
+PYTHONPATH=. python main.py evaluate --test-ratio 0.3
+
 # データ収集（要外部接続）
 PYTHONPATH=. python main.py scrape --start 2025-01-01 --end 2025-12-31
 ```
 
 ## ディレクトリ構成
 
-- `main.py` - CLIエントリーポイント (scrape / train / predict)
+- `main.py` - CLIエントリーポイント (scrape / train / predict / evaluate)
 - `config/settings.py` - 全設定値
 - `src/scraper/` - keiba.go.jpスクレイパー
 - `src/features/` - 特徴量エンジニアリング

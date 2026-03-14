@@ -143,6 +143,18 @@ def cmd_predict(args):
 
     predictions = predictor.predict(today_df)
 
+    # オッズ情報を結合
+    merge_cols = ["race_date", "race_no", "horse_number"]
+    odds_cols = merge_cols + ["odds"]
+    if "odds" in today_df.columns:
+        predictions = predictions.merge(
+            today_df[odds_cols],
+            on=merge_cols,
+            how="left",
+        )
+    else:
+        predictions["odds"] = None
+
     # 結果表示
     print(f"\n{'='*60}")
     print(f"  帯広ばんえい競馬 単勝予想  {target_date}")
@@ -150,16 +162,101 @@ def cmd_predict(args):
 
     for (rd, rno), race in predictions.groupby(["race_date", "race_no"]):
         print(f"\n--- {rno}R ---")
-        print(f"  {'順位':>4s}  {'馬番':>4s}  {'馬名':10s}  {'勝率':>8s}")
-        print(f"  {'----':>4s}  {'----':>4s}  {'----------':10s}  {'--------':>8s}")
+        has_odds = race["odds"].notna().any()
+        if has_odds:
+            print(f"  {'順位':>4s}  {'馬番':>4s}  {'馬名':10s}  {'勝率':>6s}  {'ｵｯｽﾞ':>6s}  {'期待値':>6s}")
+            print(f"  {'----':>4s}  {'----':>4s}  {'----------':10s}  {'------':>6s}  {'------':>6s}  {'------':>6s}")
+        else:
+            print(f"  {'順位':>4s}  {'馬番':>4s}  {'馬名':10s}  {'勝率':>8s}")
+            print(f"  {'----':>4s}  {'----':>4s}  {'----------':10s}  {'--------':>8s}")
+
         for _, row in race.head(5).iterrows():
             rank = int(row["pred_rank"])
             num = int(row["horse_number"]) if pd.notna(row["horse_number"]) else "-"
             name = row["horse_name"][:10]
             prob = row["win_prob"]
             mark = "◎" if rank == 1 else "○" if rank == 2 else "▲" if rank == 3 else "  "
-            print(f"  {mark}{rank:>2d}    {num:>4}  {name:10s}  {prob:>7.1%}")
 
+            if has_odds and pd.notna(row["odds"]):
+                odds_val = row["odds"]
+                expected = prob * odds_val
+                ev_mark = "★" if expected > 1.0 else "  "
+                print(f"  {mark}{rank:>2d}    {num:>4}  {name:10s}  {prob:>5.1%}  {odds_val:>5.1f}  {expected:>5.2f}{ev_mark}")
+            else:
+                print(f"  {mark}{rank:>2d}    {num:>4}  {name:10s}  {prob:>7.1%}")
+
+    print(f"\n  ★ = 期待値 > 1.0（妙味あり）")
+    print(f"{'='*60}")
+
+
+def cmd_evaluate(args):
+    """バックテスト（回収率シミュレーション）コマンド"""
+    data_file = RAW_DATA_DIR / (args.input or "race_results.csv")
+
+    if not data_file.exists():
+        logger.error("データファイルが見つかりません: %s", data_file)
+        sys.exit(1)
+
+    df = pd.read_csv(data_file)
+    fe = FeatureEngineer(df)
+    features_df = fe.build_features()
+
+    # 後半をテストデータとして使う（時系列分割）
+    split_ratio = 1 - args.test_ratio
+    race_dates = sorted(features_df["race_date"].unique())
+    split_idx = int(len(race_dates) * split_ratio)
+    train_dates = race_dates[:split_idx]
+    test_dates = race_dates[split_idx:]
+
+    train_df = features_df[features_df["race_date"].isin(train_dates)]
+    test_df = features_df[features_df["race_date"].isin(test_dates)]
+
+    logger.info("学習: %d レース日, テスト: %d レース日", len(train_dates), len(test_dates))
+
+    predictor = BaneiPredictor()
+    predictor.train(train_df)
+
+    predictions = predictor.predict(test_df)
+
+    # テストデータにオッズと着順を結合
+    merge_cols = ["race_date", "race_no", "horse_number"]
+    eval_df = predictions.merge(
+        test_df[merge_cols + ["odds", "finish_order"]],
+        on=merge_cols,
+        how="left",
+    )
+
+    # 各レースで予測1位の馬に単勝100円ずつ賭けた場合のシミュレーション
+    total_bet = 0
+    total_return = 0
+    correct = 0
+    total_races = 0
+
+    print(f"\n{'='*60}")
+    print(f"  バックテスト結果")
+    print(f"  テスト期間: {test_dates[0]} 〜 {test_dates[-1]}")
+    print(f"{'='*60}")
+
+    for (rd, rno), race in eval_df.groupby(["race_date", "race_no"]):
+        top_pick = race[race["pred_rank"] == 1].iloc[0]
+        total_bet += 100
+        total_races += 1
+
+        if top_pick["finish_order"] == 1:
+            payout = 100 * top_pick["odds"]
+            total_return += payout
+            correct += 1
+
+    hit_rate = correct / total_races if total_races > 0 else 0
+    return_rate = total_return / total_bet if total_bet > 0 else 0
+
+    print(f"\n  レース数:     {total_races}")
+    print(f"  的中数:       {correct}")
+    print(f"  的中率:       {hit_rate:.1%}")
+    print(f"  総賭金:       {total_bet:,.0f}円")
+    print(f"  総払戻:       {total_return:,.0f}円")
+    print(f"  回収率:       {return_rate:.1%}")
+    print(f"  損益:         {total_return - total_bet:+,.0f}円")
     print(f"\n{'='*60}")
 
 
@@ -187,6 +284,16 @@ def main():
         help="スクレイピングせず既存CSVデータから予測する",
     )
 
+    # evaluate
+    sp_eval = subparsers.add_parser("evaluate", help="バックテスト（回収率シミュレーション）")
+    sp_eval.add_argument("--input", help="入力CSVファイル名（デフォルト: race_results.csv）")
+    sp_eval.add_argument(
+        "--test-ratio",
+        type=float,
+        default=0.2,
+        help="テストデータの割合（デフォルト: 0.2）",
+    )
+
     args = parser.parse_args()
 
     if args.command == "scrape":
@@ -195,6 +302,8 @@ def main():
         cmd_train(args)
     elif args.command == "predict":
         cmd_predict(args)
+    elif args.command == "evaluate":
+        cmd_evaluate(args)
     else:
         parser.print_help()
 

@@ -37,71 +37,116 @@ TRAINERS = [
 SEX_OPTIONS = ["牡", "牝", "セ"]
 
 
+def _assign_horse_profiles(horse_names, jockeys, trainers, sex_options):
+    """各馬に固有プロフィール（能力・体重・性齢・騎手・調教師）を割り当てる"""
+    profiles = {}
+    for name in horse_names:
+        profiles[name] = {
+            "base_ability": random.gauss(50, 12),
+            "horse_weight": random.randint(930, 1080),
+            "sex": random.choice(sex_options),
+            "base_age": random.randint(3, 7),
+            "jockey": random.choice(jockeys),
+            "trainer": random.choice(trainers),
+        }
+    return profiles
+
+
 def generate_sample_data(
     start_date: date = date(2025, 1, 1),
     end_date: date = date(2025, 12, 31),
     races_per_day: int = 10,
     race_interval_days: int = 3,
 ) -> pd.DataFrame:
-    """サンプルレースデータを生成"""
+    """サンプルレースデータを生成
+
+    各馬に固有の能力値を持たせ、レースごとのランダム変動を加えて
+    着順を決定する。枠番・馬番はランダムに割り当てる。
+    """
     random.seed(42)
     records = []
+
+    # 馬ごとの固有プロフィールを生成
+    profiles = _assign_horse_profiles(HORSE_NAMES, JOCKEYS, TRAINERS, SEX_OPTIONS)
 
     current = start_date
     while current <= end_date:
         for race_no in range(1, races_per_day + 1):
             num_horses = random.randint(6, 10)
-            distance = random.choice([200])  # ばんえいは200m
+            distance = 200  # ばんえいは200m
 
             # 出走馬を選択
             horses = random.sample(HORSE_NAMES, num_horses)
 
-            # 各馬の能力値を設定（着順決定に使用）
-            abilities = {h: random.gauss(50, 15) for h in horses}
+            # 枠番・馬番をランダムに割り当て（着順とは無関係）
+            positions = list(range(1, num_horses + 1))
+            random.shuffle(positions)
+            horse_positions = {h: pos for h, pos in zip(horses, positions)}
+
+            # 負担重量をランダムに割り当て
+            carry_options = [560, 570, 580, 590, 600, 610, 620,
+                             630, 640, 650, 660, 670, 680, 690, 700]
+            horse_carries = {h: random.choice(carry_options) for h in horses}
+
+            # 各馬のレース能力 = 固有能力 + ランダム変動 - 負担重量の影響
+            race_abilities = {}
+            for h in horses:
+                p = profiles[h]
+                variation = random.gauss(0, 10)  # 当日の調子
+                carry_penalty = (horse_carries[h] - 620) * 0.05
+                race_abilities[h] = p["base_ability"] + variation - carry_penalty
 
             # 能力順にソート → 着順
-            sorted_horses = sorted(horses, key=lambda h: -abilities[h])
+            sorted_horses = sorted(horses, key=lambda h: -race_abilities[h])
 
             for finish_order, horse_name in enumerate(sorted_horses, 1):
-                horse_weight = random.randint(900, 1100)
-                weight_carry = random.choice([560, 570, 580, 590, 600, 610, 620, 630, 640, 650, 660, 670, 680, 690, 700])
-                jockey = random.choice(JOCKEYS)
-                trainer = random.choice(TRAINERS)
-                sex = random.choice(SEX_OPTIONS)
-                age = random.randint(3, 9)
+                p = profiles[horse_name]
+                # 馬体重に当日変動を加える
+                hw = p["horse_weight"] + random.randint(-10, 10)
+                # 年齢は開催日に応じて加算
+                years_passed = (current - start_date).days // 365
+                age = p["base_age"] + years_passed
 
                 # タイム生成（着順が早いほど速い）
-                base_time = 120 + random.gauss(0, 10)
-                time_seconds = base_time + (finish_order - 1) * random.uniform(1, 5)
+                base_time = 120 + random.gauss(0, 8)
+                time_seconds = base_time + (finish_order - 1) * random.uniform(1, 4)
                 minutes = int(time_seconds) // 60
                 secs = time_seconds - minutes * 60
                 time_str = f"{minutes}:{secs:04.1f}"
 
-                # オッズ（能力が高い馬は低オッズ）
-                odds = max(1.1, 20 - abilities[horse_name] / 5 + random.gauss(0, 3))
+                # オッズ（能力が高い馬は低オッズ + ノイズ）
+                odds = max(1.1, 20 - p["base_ability"] / 5 + random.gauss(0, 4))
 
+                # 人気順（オッズ順に後で付ける用に一時保管）
                 records.append({
                     "race_date": current.strftime("%Y-%m-%d"),
                     "race_no": str(race_no),
                     "race_name": f"第{race_no}レース",
                     "distance": distance,
                     "finish_order": finish_order,
-                    "post_position": finish_order,  # 簡略化
-                    "horse_number": finish_order,
+                    "post_position": horse_positions[horse_name],
+                    "horse_number": horse_positions[horse_name],
                     "horse_name": horse_name,
-                    "sex_age": f"{sex}{age}",
-                    "horse_weight": horse_weight,
-                    "jockey": jockey,
+                    "sex_age": f"{p['sex']}{age}",
+                    "horse_weight": hw,
+                    "jockey": p["jockey"],
                     "time": time_str,
-                    "weight_carry": weight_carry,
-                    "trainer": trainer,
+                    "weight_carry": horse_carries[horse_name],
+                    "trainer": p["trainer"],
                     "odds": round(odds, 1),
-                    "popularity": finish_order,
+                    "popularity": 0,  # 後で設定
                 })
 
         current += timedelta(days=race_interval_days)
 
-    return pd.DataFrame(records)
+    df = pd.DataFrame(records)
+
+    # 人気順をオッズ順で付与
+    df["popularity"] = df.groupby(["race_date", "race_no"])["odds"].rank(
+        method="min"
+    ).astype(int)
+
+    return df
 
 
 def main():
