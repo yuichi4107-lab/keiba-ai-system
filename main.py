@@ -97,63 +97,7 @@ def cmd_predict(args):
     else:
         target_date = date.today()
 
-    # モデル読み込み
-    predictor = BaneiPredictor()
-    try:
-        predictor.load()
-    except FileNotFoundError:
-        logger.error("学習済みモデルが見つかりません。先に `python main.py train` を実行してください")
-        sys.exit(1)
-
-    raw_file = RAW_DATA_DIR / "race_results.csv"
-
-    if getattr(args, "from_csv", False):
-        # 既存CSVから当日データを使用
-        if not raw_file.exists():
-            logger.error("データファイルが見つかりません: %s", raw_file)
-            sys.exit(1)
-        combined = pd.read_csv(raw_file)
-        logger.info("CSVデータから %s のレースを抽出", target_date)
-    else:
-        # スクレイピングで当日データを取得
-        logger.info("%s のレースデータを取得中...", target_date)
-        scraper = BaneiScraper()
-        df = scraper.scrape_date_range(target_date, target_date)
-
-        if df.empty:
-            logger.error("%s のレースデータがありません", target_date)
-            sys.exit(1)
-
-        if raw_file.exists():
-            past_df = pd.read_csv(raw_file)
-            combined = pd.concat([past_df, df], ignore_index=True)
-        else:
-            combined = df
-
-    fe = FeatureEngineer(combined)
-    features_df = fe.build_features()
-
-    # 当日分のみ抽出して予測
-    today_mask = features_df["race_date"] == pd.Timestamp(target_date)
-    today_df = features_df[today_mask]
-
-    if today_df.empty:
-        logger.error("当日のデータが見つかりません")
-        sys.exit(1)
-
-    predictions = predictor.predict(today_df)
-
-    # オッズ情報を結合
-    merge_cols = ["race_date", "race_no", "horse_number"]
-    odds_cols = merge_cols + ["odds"]
-    if "odds" in today_df.columns:
-        predictions = predictions.merge(
-            today_df[odds_cols],
-            on=merge_cols,
-            how="left",
-        )
-    else:
-        predictions["odds"] = None
+    predictions = _load_predictions_for_date(args, target_date)
 
     # 結果表示
     print(f"\n{'='*60}")
@@ -187,6 +131,219 @@ def cmd_predict(args):
 
     print(f"\n  ★ = 期待値 > 1.0（妙味あり）")
     print(f"{'='*60}")
+
+
+def _load_predictions_for_date(args, target_date):
+    """指定日の予測データを生成して返す共通処理"""
+    predictor = BaneiPredictor()
+    try:
+        predictor.load()
+    except FileNotFoundError:
+        logger.error("学習済みモデルが見つかりません。先に `python main.py train` を実行してください")
+        sys.exit(1)
+
+    raw_file = RAW_DATA_DIR / "race_results.csv"
+
+    if getattr(args, "from_csv", False):
+        if not raw_file.exists():
+            logger.error("データファイルが見つかりません: %s", raw_file)
+            sys.exit(1)
+        combined = pd.read_csv(raw_file)
+        logger.info("CSVデータから %s のレースを抽出", target_date)
+    else:
+        logger.info("%s のレースデータを取得中...", target_date)
+        scraper = BaneiScraper()
+        df = scraper.scrape_date_range(target_date, target_date)
+        if df.empty:
+            logger.error("%s のレースデータがありません", target_date)
+            sys.exit(1)
+        if raw_file.exists():
+            past_df = pd.read_csv(raw_file)
+            combined = pd.concat([past_df, df], ignore_index=True)
+        else:
+            combined = df
+
+    fe = FeatureEngineer(combined)
+    features_df = fe.build_features()
+
+    today_mask = features_df["race_date"] == pd.Timestamp(target_date)
+    today_df = features_df[today_mask]
+
+    if today_df.empty:
+        logger.error("当日のデータが見つかりません")
+        sys.exit(1)
+
+    predictions = predictor.predict(today_df)
+
+    # オッズ情報を結合
+    merge_cols = ["race_date", "race_no", "horse_number"]
+    if "odds" in today_df.columns:
+        predictions = predictions.merge(
+            today_df[merge_cols + ["odds"]],
+            on=merge_cols,
+            how="left",
+        )
+    else:
+        predictions["odds"] = None
+
+    return predictions
+
+
+def _analyze_race(race_df):
+    """レースごとの分析指標を計算する"""
+    top1 = race_df[race_df["pred_rank"] == 1].iloc[0]
+    top2 = race_df[race_df["pred_rank"] == 2].iloc[0]
+
+    prob1 = top1["win_prob"]
+    prob2 = top2["win_prob"]
+    confidence = prob1 - prob2  # 1位と2位の確率差
+
+    odds1 = top1["odds"] if pd.notna(top1["odds"]) else 0
+    expected_value = prob1 * odds1 if odds1 > 0 else 0
+
+    return {
+        "top_horse": top1["horse_name"],
+        "top_number": int(top1["horse_number"]) if pd.notna(top1["horse_number"]) else 0,
+        "top_prob": prob1,
+        "top_odds": odds1,
+        "expected_value": expected_value,
+        "confidence": confidence,
+        "num_runners": len(race_df),
+    }
+
+
+def _judge_race(analysis):
+    """レースの購入推奨度を判定する
+
+    判定基準:
+    - S: 期待値1.5以上かつ信頼度(確率差)20%以上 → 強く推奨
+    - A: 期待値1.2以上かつ信頼度15%以上 → 推奨
+    - B: 期待値1.0以上 → やや推奨
+    - C: 上記に該当しない → 見送り
+    """
+    ev = analysis["expected_value"]
+    conf = analysis["confidence"]
+
+    if ev >= 1.5 and conf >= 0.20:
+        return "S"
+    elif ev >= 1.2 and conf >= 0.15:
+        return "A"
+    elif ev >= 1.0:
+        return "B"
+    else:
+        return "C"
+
+
+def cmd_recommend(args):
+    """推奨馬券コマンド（1R〜12R + 購入レース選定）"""
+    if args.date:
+        target_date = datetime.strptime(args.date, "%Y-%m-%d").date()
+    else:
+        target_date = date.today()
+
+    predictions = _load_predictions_for_date(args, target_date)
+
+    # --- 全レース予想 + レース分析 ---
+    race_analyses = {}
+    race_groups = list(predictions.groupby(["race_date", "race_no"]))
+
+    print(f"\n{'='*64}")
+    print(f"  帯広ばんえい競馬 単勝推奨馬券  {target_date}")
+    print(f"{'='*64}")
+
+    for (rd, rno), race in race_groups:
+        analysis = _analyze_race(race)
+        grade = _judge_race(analysis)
+        race_analyses[rno] = {"analysis": analysis, "grade": grade}
+
+        grade_mark = {"S": "【S】", "A": "【A】", "B": "【B】", "C": "【C】"}[grade]
+
+        print(f"\n--- {rno}R {grade_mark} ---")
+        has_odds = race["odds"].notna().any()
+
+        if has_odds:
+            print(f"    {'馬番':>4s}  {'馬名':10s}  {'勝率':>6s}  {'ｵｯｽﾞ':>6s}  {'期待値':>6s}")
+            print(f"    {'----':>4s}  {'----------':10s}  {'------':>6s}  {'------':>6s}  {'------':>6s}")
+        else:
+            print(f"    {'馬番':>4s}  {'馬名':10s}  {'勝率':>8s}")
+            print(f"    {'----':>4s}  {'----------':10s}  {'--------':>8s}")
+
+        for _, row in race.head(5).iterrows():
+            rank = int(row["pred_rank"])
+            num = int(row["horse_number"]) if pd.notna(row["horse_number"]) else "-"
+            name = row["horse_name"][:10]
+            prob = row["win_prob"]
+            mark = "◎" if rank == 1 else "○" if rank == 2 else "▲" if rank == 3 else "  "
+
+            if has_odds and pd.notna(row["odds"]):
+                odds_val = row["odds"]
+                expected = prob * odds_val
+                ev_mark = "★" if expected > 1.0 else "  "
+                print(f"  {mark} {num:>4}  {name:10s}  {prob:>5.1%}  {odds_val:>5.1f}  {expected:>5.2f}{ev_mark}")
+            else:
+                print(f"  {mark} {num:>4}  {name:10s}  {prob:>7.1%}")
+
+    # --- 購入推奨レースまとめ ---
+    print(f"\n{'='*64}")
+    print(f"  購入推奨レース")
+    print(f"{'='*64}")
+    print()
+
+    buy_races = {rno: v for rno, v in race_analyses.items() if v["grade"] in ("S", "A")}
+    maybe_races = {rno: v for rno, v in race_analyses.items() if v["grade"] == "B"}
+    skip_races = {rno: v for rno, v in race_analyses.items() if v["grade"] == "C"}
+
+    total_cost = 0
+
+    if buy_races:
+        print("  ◆ 購入推奨（自信度: 高）")
+        for rno, v in sorted(buy_races.items()):
+            a = v["analysis"]
+            g = v["grade"]
+            total_cost += 100
+            print(
+                f"    {str(rno):>2s}R [{g}]  {a['top_number']:>2d}番 {a['top_horse'][:8]:8s}"
+                f"  勝率{a['top_prob']:>5.1%}  ｵｯｽﾞ{a['top_odds']:>5.1f}"
+                f"  期待値{a['expected_value']:>5.2f}"
+            )
+        print()
+
+    if maybe_races:
+        print("  ◇ 検討（期待値はあるが自信度やや低）")
+        for rno, v in sorted(maybe_races.items()):
+            a = v["analysis"]
+            g = v["grade"]
+            total_cost += 100
+            print(
+                f"    {str(rno):>2s}R [{g}]  {a['top_number']:>2d}番 {a['top_horse'][:8]:8s}"
+                f"  勝率{a['top_prob']:>5.1%}  ｵｯｽﾞ{a['top_odds']:>5.1f}"
+                f"  期待値{a['expected_value']:>5.2f}"
+            )
+        print()
+
+    if skip_races:
+        print("  ✕ 見送り（期待値 < 1.0）")
+        for rno, v in sorted(skip_races.items()):
+            a = v["analysis"]
+            print(
+                f"    {str(rno):>2s}R      {a['top_number']:>2d}番 {a['top_horse'][:8]:8s}"
+                f"  勝率{a['top_prob']:>5.1%}  ｵｯｽﾞ{a['top_odds']:>5.1f}"
+                f"  期待値{a['expected_value']:>5.2f}"
+            )
+        print()
+
+    num_buy = len(buy_races) + len(maybe_races)
+    print(f"{'='*64}")
+    print(f"  本日の購入レース数: {num_buy} / {len(race_analyses)}")
+    print(f"  合計投資額（単勝各100円）: {total_cost:,}円")
+    print(f"{'='*64}")
+    print()
+    print("  判定基準:")
+    print("    S = 期待値1.5以上 & 信頼度20%以上（強く推奨）")
+    print("    A = 期待値1.2以上 & 信頼度15%以上（推奨）")
+    print("    B = 期待値1.0以上（検討）")
+    print("    C = 期待値1.0未満（見送り）")
+    print(f"{'='*64}")
 
 
 def cmd_evaluate(args):
@@ -284,6 +441,15 @@ def main():
         help="スクレイピングせず既存CSVデータから予測する",
     )
 
+    # recommend
+    sp_rec = subparsers.add_parser("recommend", help="推奨馬券（購入レース選定付き）")
+    sp_rec.add_argument("--date", help="予測日 (YYYY-MM-DD, デフォルト: 本日)")
+    sp_rec.add_argument(
+        "--from-csv",
+        action="store_true",
+        help="スクレイピングせず既存CSVデータから予測する",
+    )
+
     # evaluate
     sp_eval = subparsers.add_parser("evaluate", help="バックテスト（回収率シミュレーション）")
     sp_eval.add_argument("--input", help="入力CSVファイル名（デフォルト: race_results.csv）")
@@ -302,6 +468,8 @@ def main():
         cmd_train(args)
     elif args.command == "predict":
         cmd_predict(args)
+    elif args.command == "recommend":
+        cmd_recommend(args)
     elif args.command == "evaluate":
         cmd_evaluate(args)
     else:

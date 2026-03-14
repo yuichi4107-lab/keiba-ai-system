@@ -55,7 +55,7 @@ def _assign_horse_profiles(horse_names, jockeys, trainers, sex_options):
 def generate_sample_data(
     start_date: date = date(2025, 1, 1),
     end_date: date = date(2025, 12, 31),
-    races_per_day: int = 10,
+    races_per_day: int = 12,
     race_interval_days: int = 3,
 ) -> pd.DataFrame:
     """サンプルレースデータを生成
