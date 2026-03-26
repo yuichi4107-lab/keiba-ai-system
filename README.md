@@ -8,6 +8,22 @@ LightGBMを使用した帯広ばんえい競馬の単勝予想AIシステムで�
 pip install -r requirements.txt
 ```
 
+開発用コマンドは `PYTHONPATH=.` を付けて実行してください。
+
+## ClaudeCode / AIアシスタント利用
+
+- ClaudeCode を使う場合は、最初に `CLAUDE.md` を参照してください。
+- リモート環境では `.claude/settings.json` から SessionStart フックが実行され、依存関係の導入と `PYTHONPATH=.` の設定が行われます。
+- ローカル環境では通常のセットアップが必要です。少なくとも `pip install -r requirements.txt` を実行し、各コマンドは `PYTHONPATH=.` を付けてください。
+
+よく使う例:
+
+```bash
+PYTHONPATH=. python -m pytest tests/ -v
+PYTHONPATH=. python main.py train
+PYTHONPATH=. python main.py predict --date 2025-12-30 --from-csv
+```
+
 ## 使い方
 
 ### 1. データ収集
@@ -15,7 +31,7 @@ pip install -r requirements.txt
 地方競馬公式サイトからレース結果データをスクレイピングします。
 
 ```bash
-python main.py scrape --start 2025-01-01 --end 2025-12-31
+PYTHONPATH=. python main.py scrape --start 2025-01-01 --end 2025-12-31
 ```
 
 ### 2. モデル学習
@@ -23,7 +39,7 @@ python main.py scrape --start 2025-01-01 --end 2025-12-31
 収集したデータから特徴量を生成し、LightGBMモデルを学習します。
 
 ```bash
-python main.py train
+PYTHONPATH=. python main.py train
 ```
 
 ### 3. レース予測
@@ -32,10 +48,10 @@ python main.py train
 
 ```bash
 # 本日のレース
-python main.py predict
+PYTHONPATH=. python main.py predict
 
 # 日付指定
-python main.py predict --date 2026-03-14
+PYTHONPATH=. python main.py predict --date 2026-03-14
 ```
 
 ## 特徴量

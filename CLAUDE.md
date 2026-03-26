@@ -4,11 +4,17 @@
 LightGBMを使ったばんえい競馬の単勝予測システム。
 地方競馬公式サイト(keiba.go.jp)からデータを収集し、機械学習で予測する。
 
+## ClaudeCode 利用メモ
+
+- `.claude/settings.json` で SessionStart フックを設定している。
+- リモート環境では `.claude/hooks/session-start.sh` により依存関係のインストールと `PYTHONPATH=.` の設定を行う。
+- ローカル環境では `pip install -r requirements.txt` を実行し、各コマンドに `PYTHONPATH=.` を付けること。
+
 ## コマンド
 
 ```bash
 # テスト実行
-python -m pytest tests/ -v
+PYTHONPATH=. python -m pytest tests/ -v
 
 # サンプルデータ生成（スクレイピングできない環境用）
 PYTHONPATH=. python scripts/generate_sample_data.py
